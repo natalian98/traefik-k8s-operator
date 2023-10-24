@@ -11,9 +11,8 @@ import json
 import logging
 import re
 import socket
-import typing
 from string import Template
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import yaml
@@ -28,6 +27,12 @@ from charms.certificate_transfer_interface.v0.certificate_transfer import (
 )
 from charms.grafana_k8s.v0.grafana_dashboard import GrafanaDashboardProvider
 from charms.loki_k8s.v0.loki_push_api import LogProxyConsumer
+from charms.oathkeeper.v0.forward_auth import (
+    ForwardAuthConfigChangedEvent,
+    ForwardAuthConfigRemovedEvent,
+    ForwardAuthRequirer,
+    RequirerConfig,
+)
 from charms.observability_libs.v0.cert_handler import CertHandler
 from charms.observability_libs.v1.kubernetes_service_patch import (
     KubernetesServicePatch,
@@ -221,6 +226,11 @@ class TraefikIngressCharm(CharmBase):
                 self.on.update_status,  # type: ignore
             ],
         )
+
+        self.forward_auth = ForwardAuthRequirer(
+            self, forward_auth_requirer_config=self._forward_auth_requirer_config
+        )
+
         observe = self.framework.observe
 
         # TODO update init params once auto-renew is implemented
@@ -254,6 +264,13 @@ class TraefikIngressCharm(CharmBase):
             self._on_recv_ca_cert_removed,
         )
 
+        observe(
+            self.forward_auth.on.forward_auth_config_changed, self._on_forward_auth_config_changed
+        )
+        observe(
+            self.forward_auth.on.forward_auth_config_removed, self._on_forward_auth_config_removed
+        )
+
         # observe data_provided and data_removed events for all types of ingress we offer:
         for ingress in (self.ingress_per_unit, self.ingress_per_appv1, self.ingress_per_appv2):
             observe(ingress.on.data_provided, self._handle_ingress_data_provided)  # type: ignore
@@ -265,6 +282,40 @@ class TraefikIngressCharm(CharmBase):
 
         # Action handlers
         observe(self.on.show_proxied_endpoints_action, self._on_show_proxied_endpoints)  # type: ignore
+
+    @property
+    def _service_ports(self) -> List[ServicePort]:
+        """Kubernetes service ports to be opened for this workload.
+
+        We cannot use ops unit.open_port here because Juju will provision a ClusterIP
+        but for traefik we need LoadBalancer.
+        """
+        traefik = self.traefik
+        service_name = traefik.service_name
+        web = ServicePort(traefik.port, name=f"{service_name}")
+        websecure = ServicePort(traefik.tls_port, name=f"{service_name}-tls")
+        return [web, websecure] + [
+            ServicePort(int(port), name=name) for name, port in self._tcp_entrypoints().items()
+        ]
+    
+    def _forward_auth_requirer_config(self) -> RequirerConfig:
+        ingress_app_names = []
+        for ingress_relation in (
+            self.ingress_per_appv1.relations
+            + self.ingress_per_appv2.relations
+            + self.ingress_per_unit.relations
+            + self.traefik_route.relations
+        ):
+            ingress_app_names.append(ingress_relation.app.name)
+        return RequirerConfig(ingress_app_names)
+
+    def _on_forward_auth_config_changed(self, event: ForwardAuthConfigChangedEvent):
+        self.forward_auth.update_requirer_relation_data(self._forward_auth_requirer_config)
+        if self.forward_auth.is_ready():
+            self._process_status_and_configurations()
+
+    def _on_forward_auth_config_removed(self, event: ForwardAuthConfigRemovedEvent):
+        self._process_status_and_configurations()
 
     def _on_recv_ca_cert_available(self, event: CertificateTransferAvailableEvent):
         # Assuming only one cert per relation (this is in line with the original lib design).
@@ -721,6 +772,9 @@ class TraefikIngressCharm(CharmBase):
         # update-status.
         self._process_status_and_configurations()
 
+        if self.forward_auth.is_ready():
+            self.forward_auth.update_requirer_relation_data(self._forward_auth_requirer_config)
+
         if isinstance(self.unit.status, MaintenanceStatus):
             self.unit.status = ActiveStatus()
 
@@ -729,6 +783,9 @@ class TraefikIngressCharm(CharmBase):
         self._wipe_ingress_for_relation(
             event.relation, wipe_rel_data=not isinstance(event, RelationBrokenEvent)
         )
+
+        if self.forward_auth.is_ready():
+            self.forward_auth.update_requirer_relation_data(self._forward_auth_requirer_config)
 
         # FIXME? on relation broken, data is still there so cannot simply call
         #  self._process_status_and_configurations(). For this reason, the static config in
@@ -930,6 +987,21 @@ class TraefikIngressCharm(CharmBase):
           "cannot create middleware: multi-types middleware not supported, consider declaring two
           different pieces of middleware instead"
         """
+        forwardauth_middleware = {}
+        if self.forward_auth.is_ready():
+            # Define the middleware only for Oathkeeper
+            policy_decision_point_app = self.forward_auth.get_remote_app_name()
+            if data.get("name") == policy_decision_point_app:
+                forward_auth_config = self.forward_auth.get_provider_info()
+                forwardauth_middleware[
+                    f"juju-sidecar-forward-auth-{policy_decision_point_app}"
+                ] = {
+                    "forwardAuth": {
+                        "address": forward_auth_config.decisions_address,
+                        "authResponseHeaders": forward_auth_config.headers,
+                    }
+                }
+
         no_prefix_middleware = {}  # type: Dict[str, Dict[str, Any]]
         if self._routing_mode is _RoutingMode.path:
             if data.get("strip-prefix", False):
@@ -945,7 +1017,7 @@ class TraefikIngressCharm(CharmBase):
                 "redirectScheme": {"scheme": "https", "port": 443, "permanent": True}
             }
 
-        return {**no_prefix_middleware, **redir_scheme_middleware}
+        return {**forwardauth_middleware, **no_prefix_middleware, **redir_scheme_middleware}
 
     def _generate_per_unit_tcp_config(self, prefix: str, data: RequirerData_IPU) -> dict:
         """Generate a config dict for a given unit for IngressPerUnit in tcp mode."""
@@ -1076,7 +1148,44 @@ class TraefikIngressCharm(CharmBase):
             if f"{traefik_router_name}-tls" in router_cfg:
                 router_cfg[f"{traefik_router_name}-tls"]["middlewares"] = list(middlewares.keys())
 
+        if self.forward_auth.is_ready():
+            (
+                router_cfg[traefik_router_name]["middlewares"],
+                router_cfg[f"{traefik_router_name}-tls"]["middlewares"],
+            ) = self._update_middlewares_with_forward_auth(traefik_router_name, data, router_cfg)
+
         return config
+
+    def _update_middlewares_with_forward_auth(
+        self, traefik_router_name: str, data: Dict[str, Any], router_cfg: Dict[str, Any]
+    ) -> Tuple[Any, Any]:
+        """Update the configuration segment with forwardAuth middleware."""
+        forward_auth_middleware = (
+            f"juju-sidecar-forward-auth-{self.forward_auth.get_remote_app_name()}"
+        )
+
+        if data.get("name") == self.forward_auth.get_remote_app_name():
+            # Remove the middleware key from oathkeeper; keep only its definition
+            router_cfg[traefik_router_name]["middlewares"].remove(forward_auth_middleware)
+            if f"{traefik_router_name}-tls" in router_cfg:
+                router_cfg[f"{traefik_router_name}-tls"]["middlewares"].remove(
+                    forward_auth_middleware
+                )
+
+        # Append the middleware if the app name was provided by forward-auth
+        forward_auth_config = self.forward_auth.get_provider_info()
+        if data.get("name") in forward_auth_config.app_names:
+            # ForwardAuth must come before other middlewares
+            router_cfg[traefik_router_name]["middlewares"].insert(0, forward_auth_middleware)
+            if f"{traefik_router_name}-tls" in router_cfg:
+                router_cfg[f"{traefik_router_name}-tls"]["middlewares"].insert(
+                    0, forward_auth_middleware
+                )
+
+        return (
+            router_cfg[traefik_router_name]["middlewares"],
+            router_cfg[f"{traefik_router_name}-tls"]["middlewares"],
+        )
 
     def _generate_tls_block(
         self,
