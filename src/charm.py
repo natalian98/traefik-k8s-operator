@@ -9,7 +9,8 @@ import functools
 import json
 import logging
 import socket
-from typing import Any, Dict, List, Optional, Union
+from string import Template
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import yaml
@@ -24,6 +25,12 @@ from charms.certificate_transfer_interface.v0.certificate_transfer import (
 )
 from charms.grafana_k8s.v0.grafana_dashboard import GrafanaDashboardProvider
 from charms.loki_k8s.v0.loki_push_api import LogProxyConsumer
+from charms.oathkeeper.v0.forward_auth import (
+    ForwardAuthConfigChangedEvent,
+    ForwardAuthConfigRemovedEvent,
+    ForwardAuthRequirer,
+    RequirerConfig,
+)
 from charms.observability_libs.v0.cert_handler import CertHandler
 from charms.observability_libs.v1.kubernetes_service_patch import (
     KubernetesServicePatch,
@@ -190,6 +197,11 @@ class TraefikIngressCharm(CharmBase):
                 self.on.update_status,  # type: ignore
             ],
         )
+
+        self.forward_auth = ForwardAuthRequirer(
+            self, forward_auth_requirer_config=self._forward_auth_requirer_config
+        )
+
         observe = self.framework.observe
 
         # TODO update init params once auto-renew is implemented
@@ -223,6 +235,13 @@ class TraefikIngressCharm(CharmBase):
             self._on_recv_ca_cert_removed,
         )
 
+        observe(
+            self.forward_auth.on.forward_auth_config_changed, self._on_forward_auth_config_changed
+        )
+        observe(
+            self.forward_auth.on.forward_auth_config_removed, self._on_forward_auth_config_removed
+        )
+
         # observe data_provided and data_removed events for all types of ingress we offer:
         for ingress in (self.ingress_per_unit, self.ingress_per_appv1, self.ingress_per_appv2):
             observe(ingress.on.data_provided, self._handle_ingress_data_provided)  # type: ignore
@@ -249,6 +268,25 @@ class TraefikIngressCharm(CharmBase):
         return [web, websecure] + [
             ServicePort(int(port), name=name) for name, port in self._tcp_entrypoints().items()
         ]
+    
+    def _forward_auth_requirer_config(self) -> RequirerConfig:
+        ingress_app_names = []
+        for ingress_relation in (
+            self.ingress_per_appv1.relations
+            + self.ingress_per_appv2.relations
+            + self.ingress_per_unit.relations
+            + self.traefik_route.relations
+        ):
+            ingress_app_names.append(ingress_relation.app.name)
+        return RequirerConfig(ingress_app_names)
+
+    def _on_forward_auth_config_changed(self, event: ForwardAuthConfigChangedEvent):
+        self.forward_auth.update_requirer_relation_data(self._forward_auth_requirer_config)
+        if self.forward_auth.is_ready():
+            self._process_status_and_configurations()
+
+    def _on_forward_auth_config_removed(self, event: ForwardAuthConfigRemovedEvent):
+        self._process_status_and_configurations()
 
     def _on_recv_ca_cert_available(self, event: CertificateTransferAvailableEvent):
         # Assuming only one cert per relation (this is in line with the original lib design).
@@ -551,6 +589,9 @@ class TraefikIngressCharm(CharmBase):
         # update-status.
         self._process_status_and_configurations()
 
+        if self.forward_auth.is_ready():
+            self.forward_auth.update_requirer_relation_data(self._forward_auth_requirer_config)
+
         if isinstance(self.unit.status, MaintenanceStatus):
             self.unit.status = ActiveStatus()
 
@@ -559,6 +600,9 @@ class TraefikIngressCharm(CharmBase):
         self._wipe_ingress_for_relation(
             event.relation, wipe_rel_data=not isinstance(event, RelationBrokenEvent)
         )
+
+        if self.forward_auth.is_ready():
+            self.forward_auth.update_requirer_relation_data(self._forward_auth_requirer_config)
 
         # FIXME? on relation broken, data is still there so cannot simply call
         #  self._process_status_and_configurations(). For this reason, the static config in
@@ -793,6 +837,268 @@ class TraefikIngressCharm(CharmBase):
     def _get_prefix(data: Dict[str, Any]):
         name = data["name"].replace("/", "-")
         return f"{data['model']}-{name}"
+
+    def _generate_middleware_config(
+        self,
+        data: Dict[str, Any],
+        prefix: str,
+    ) -> dict:
+        """Generate a middleware config.
+
+        We need to generate a different section per middleware type, otherwise traefik complains:
+          "cannot create middleware: multi-types middleware not supported, consider declaring two
+          different pieces of middleware instead"
+        """
+        forwardauth_middleware = {}
+        if self.forward_auth.is_ready():
+            # Define the middleware only for Oathkeeper
+            policy_decision_point_app = self.forward_auth.get_remote_app_name()
+            if data.get("name") == policy_decision_point_app:
+                forward_auth_config = self.forward_auth.get_provider_info()
+                forwardauth_middleware[
+                    f"juju-sidecar-forward-auth-{policy_decision_point_app}"
+                ] = {
+                    "forwardAuth": {
+                        "address": forward_auth_config.decisions_address,
+                        "authResponseHeaders": forward_auth_config.headers,
+                    }
+                }
+
+        no_prefix_middleware = {}  # type: Dict[str, Dict[str, Any]]
+        if self._routing_mode is _RoutingMode.path:
+            if data.get("strip-prefix", False):
+                no_prefix_middleware[f"juju-sidecar-noprefix-{prefix}"] = {
+                    "stripPrefix": {"prefixes": [f"/{prefix}"], "forceSlash": False}
+                }
+
+        # Condition rendering the https-redirect middleware on the scheme, otherwise we'd get a 404
+        # when attempting to reach an http endpoint.
+        redir_scheme_middleware = {}
+        if data.get("redirect-https", False) and data.get("scheme") == "https":
+            redir_scheme_middleware[f"juju-sidecar-redir-https-{prefix}"] = {
+                "redirectScheme": {"scheme": "https", "port": 443, "permanent": True}
+            }
+
+        return {**forwardauth_middleware, **no_prefix_middleware, **redir_scheme_middleware}
+
+    def _generate_per_unit_tcp_config(self, prefix: str, data: RequirerData_IPU) -> dict:
+        """Generate a config dict for a given unit for IngressPerUnit in tcp mode."""
+        # TODO: is there a reason why SNI-based routing (from TLS certs) is per-unit only?
+        # This is not a technical limitation in any way. It's meaningful/useful for
+        # authenticating to individual TLS-based servers where it may be desirable to reach
+        # one or more servers in a cluster (let's say Kafka), but limiting it to per-unit only
+        # actively impedes the architectural design of any distributed/ring-buffered TLS-based
+        # scale-out services which may only have frontends dedicated, but which do not "speak"
+        # HTTP(S). Such as any of the "cloud-native" SQL implementations (TiDB, Cockroach, etc)
+        config = {
+            "tcp": {
+                "routers": {
+                    f"juju-{prefix}-tcp-router": {
+                        "rule": "HostSNI(`*`)",
+                        "service": f"juju-{prefix}-tcp-service",
+                        # or whatever entrypoint I defined in static config
+                        "entryPoints": [prefix],
+                    },
+                },
+                "services": {
+                    f"juju-{prefix}-tcp-service": {
+                        "loadBalancer": {
+                            "servers": [{"address": f"{data['host']}:{data['port']}"}]
+                        }
+                    },
+                },
+            }
+        }
+        return config
+
+    def _generate_per_unit_http_config(self, prefix: str, data: RequirerData_IPU) -> dict:
+        """Generate a config dict for a given unit for IngressPerUnit."""
+        lb_servers = [{"url": f"{data.get('scheme', 'http')}://{data['host']}:{data['port']}"}]
+        return self._generate_config_block(prefix, lb_servers, data)  # type: ignore
+
+    def _generate_config_block(
+        self,
+        prefix: str,
+        lb_servers: List[Dict[str, str]],
+        data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Generate a configuration segment.
+
+        Per-unit and per-app configuration blocks are mostly similar, with the principal
+        difference being the list of servers to load balance across (where IPU is one server per
+        unit and IPA may be more than one).
+        """
+        host = self.external_host
+        if self._routing_mode is _RoutingMode.path:
+            route_rule = f"PathPrefix(`/{prefix}`)"
+        else:  # _RoutingMode.subdomain
+            route_rule = f"Host(`{prefix}.{host}`)"
+
+        traefik_router_name = f"juju-{prefix}-router"
+        traefik_service_name = f"juju-{prefix}-service"
+
+        router_cfg = {
+            traefik_router_name: {
+                "rule": route_rule,
+                "service": traefik_service_name,
+                "entryPoints": ["web"],
+            },
+        }
+        router_cfg.update(
+            self._generate_tls_block(traefik_router_name, route_rule, traefik_service_name)
+        )
+
+        # Add the "rootsCAs" section only if TLS is enabled. If the rootCA section
+        # is empty or the file does not exist, HTTP requests will fail with
+        # "404 page not found".
+        # Note: we're assuming here that the CA that signed traefik's own CSR is
+        # the same CA that signed the service's servers CSRs.
+        external_tls = self._is_tls_enabled()
+
+        # REVERSE TERMINATION: we are providing ingress for a unit who is itself behind https,
+        # but traefik is not.
+        internal_tls = data.get("scheme") == "https"
+
+        is_reverse_termination = not external_tls and internal_tls
+        is_termination = external_tls and not internal_tls
+        is_end_to_end = external_tls and internal_tls
+
+        lb_def: Dict[str, Any] = {"servers": lb_servers}
+        service_def = {
+            "loadBalancer": lb_def,
+        }
+
+        if is_reverse_termination:
+            # i.e. traefik itself is not related to tls certificates, but the ingress requirer is
+            transport_name = "reverseTerminationTransport"
+            lb_def["serversTransport"] = transport_name
+            transports = {transport_name: {"insecureSkipVerify": False}}
+
+        elif is_termination:
+            # i.e. traefik itself is related to tls certificates, but the ingress requirer is not
+            transports = {}
+
+        elif is_end_to_end:
+            # We cannot assume traefik's CA is the same CA that signed the proxied apps.
+            # Since we use the update_ca_certificates machinery, we don't need to specify the
+            # "rootCAs" entry.
+            # Keeping the serverTransports section anyway because it is informative ("endToEndTLS"
+            # vs "reverseTerminationTransport") when inspecting the config file in production.
+            transport_name = "endToEndTLS"
+            lb_def["serversTransport"] = transport_name
+            transports = {transport_name: {"insecureSkipVerify": False}}
+
+        else:
+            transports = {}
+
+        config = {
+            "http": {
+                "routers": router_cfg,
+                "services": {traefik_service_name: service_def},
+            },
+        }
+        # Traefik does not accept an empty serversTransports. Add it only if it's non-empty.
+        if transports:
+            config["http"].update({"serversTransports": transports})
+
+        middlewares = self._generate_middleware_config(data, prefix)
+
+        if middlewares:
+            config["http"]["middlewares"] = middlewares
+            router_cfg[traefik_router_name]["middlewares"] = list(middlewares.keys())
+
+            if f"{traefik_router_name}-tls" in router_cfg:
+                router_cfg[f"{traefik_router_name}-tls"]["middlewares"] = list(middlewares.keys())
+
+        if self.forward_auth.is_ready():
+            (
+                router_cfg[traefik_router_name]["middlewares"],
+                router_cfg[f"{traefik_router_name}-tls"]["middlewares"],
+            ) = self._update_middlewares_with_forward_auth(traefik_router_name, data, router_cfg)
+
+        return config
+
+    def _update_middlewares_with_forward_auth(
+        self, traefik_router_name: str, data: Dict[str, Any], router_cfg: Dict[str, Any]
+    ) -> Tuple[Any, Any]:
+        """Update the configuration segment with forwardAuth middleware."""
+        forward_auth_middleware = (
+            f"juju-sidecar-forward-auth-{self.forward_auth.get_remote_app_name()}"
+        )
+
+        if data.get("name") == self.forward_auth.get_remote_app_name():
+            # Remove the middleware key from oathkeeper; keep only its definition
+            router_cfg[traefik_router_name]["middlewares"].remove(forward_auth_middleware)
+            if f"{traefik_router_name}-tls" in router_cfg:
+                router_cfg[f"{traefik_router_name}-tls"]["middlewares"].remove(
+                    forward_auth_middleware
+                )
+
+        # Append the middleware if the app name was provided by forward-auth
+        forward_auth_config = self.forward_auth.get_provider_info()
+        if data.get("name") in forward_auth_config.app_names:
+            # ForwardAuth must come before other middlewares
+            router_cfg[traefik_router_name]["middlewares"].insert(0, forward_auth_middleware)
+            if f"{traefik_router_name}-tls" in router_cfg:
+                router_cfg[f"{traefik_router_name}-tls"]["middlewares"].insert(
+                    0, forward_auth_middleware
+                )
+
+        return (
+            router_cfg[traefik_router_name]["middlewares"],
+            router_cfg[f"{traefik_router_name}-tls"]["middlewares"],
+        )
+
+    def _generate_tls_block(
+        self,
+        router_name: str,
+        route_rule: str,
+        service_name: str,
+    ) -> Dict[str, Any]:
+        """Generate a TLS configuration segment."""
+        tls_entry = (
+            {
+                "domains": [
+                    {
+                        "main": self.external_host,
+                        "sans": [f"*.{self.external_host}"],
+                    },
+                ],
+            }
+            if is_hostname(self.external_host)
+            else {}  # When the external host is a bare IP, we do not need the 'domains' entry.
+        )
+
+        return {
+            f"{router_name}-tls": {
+                "rule": route_rule,
+                "service": service_name,
+                "entryPoints": ["websecure"],
+                "tls": tls_entry,
+            }
+        }
+
+    def _generate_per_app_config(
+        self,
+        prefix: str,
+        data: "IPADatav2",
+    ) -> dict:
+        # todo: IPA>=v2 uses pydantic models, the other providers use raw dicts.
+        #  eventually switch all over to pydantic and handle this uniformly
+        app_dict = data.app.dict(by_alias=True)
+        lb_servers = [
+            {"url": f"{data.app.scheme}://{unit_data.host}:{data.app.port}"}
+            for unit_data in data.units
+        ]
+        return self._generate_config_block(prefix, lb_servers, app_dict)
+
+    def _generate_per_leader_config(
+        self,
+        prefix: str,
+        data: "IPADatav1",
+    ) -> dict:
+        lb_servers = [{"url": f"http://{data['host']}:{data['port']}"}]
+        return self._generate_config_block(prefix, lb_servers, data)  # type: ignore
 
     @property
     def _scheme(self):
