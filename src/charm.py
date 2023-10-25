@@ -306,7 +306,7 @@ class TraefikIngressCharm(CharmBase):
             + self.ingress_per_unit.relations
             + self.traefik_route.relations
         ):
-            ingress_app_names.append(ingress_relation.app.name)
+            ingress_app_names.append(ingress_relation.app.name)  # type: ignore
         return RequirerConfig(ingress_app_names)
 
     def _on_forward_auth_config_changed(self, event: ForwardAuthConfigChangedEvent):
@@ -997,8 +997,8 @@ class TraefikIngressCharm(CharmBase):
                     f"juju-sidecar-forward-auth-{policy_decision_point_app}"
                 ] = {
                     "forwardAuth": {
-                        "address": forward_auth_config.decisions_address,
-                        "authResponseHeaders": forward_auth_config.headers,
+                        "address": forward_auth_config.decisions_address,  # type: ignore
+                        "authResponseHeaders": forward_auth_config.headers,  # type: ignore
                     }
                 }
 
@@ -1174,7 +1174,7 @@ class TraefikIngressCharm(CharmBase):
 
         # Append the middleware if the app name was provided by forward-auth
         forward_auth_config = self.forward_auth.get_provider_info()
-        if data.get("name") in forward_auth_config.app_names:
+        if data.get("name") in forward_auth_config.app_names:  # type: ignore
             # ForwardAuth must come before other middlewares
             router_cfg[traefik_router_name]["middlewares"].insert(0, forward_auth_middleware)
             if f"{traefik_router_name}-tls" in router_cfg:
