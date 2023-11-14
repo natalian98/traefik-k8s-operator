@@ -12,7 +12,7 @@ import logging
 import re
 import socket
 from string import Template
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
 
 import yaml
@@ -989,10 +989,9 @@ class TraefikIngressCharm(CharmBase):
         """
         forwardauth_middleware = {}
         if self.forward_auth.is_ready():
-            # Define the middleware only for Oathkeeper
-            policy_decision_point_app = self.forward_auth.get_remote_app_name()
-            if data.get("name") == policy_decision_point_app:
-                forward_auth_config = self.forward_auth.get_provider_info()
+            forward_auth_config = self.forward_auth.get_provider_info()
+            if data.get("name") in forward_auth_config.app_names:  # type: ignore
+                policy_decision_point_app = self.forward_auth.get_remote_app_name()
                 forwardauth_middleware[
                     f"juju-sidecar-forward-auth-{policy_decision_point_app}"
                 ] = {
@@ -1148,44 +1147,7 @@ class TraefikIngressCharm(CharmBase):
             if f"{traefik_router_name}-tls" in router_cfg:
                 router_cfg[f"{traefik_router_name}-tls"]["middlewares"] = list(middlewares.keys())
 
-        if self.forward_auth.is_ready():
-            (
-                router_cfg[traefik_router_name]["middlewares"],
-                router_cfg[f"{traefik_router_name}-tls"]["middlewares"],
-            ) = self._update_middlewares_with_forward_auth(traefik_router_name, data, router_cfg)
-
         return config
-
-    def _update_middlewares_with_forward_auth(
-        self, traefik_router_name: str, data: Dict[str, Any], router_cfg: Dict[str, Any]
-    ) -> Tuple[Any, Any]:
-        """Update the configuration segment with forwardAuth middleware."""
-        forward_auth_middleware = (
-            f"juju-sidecar-forward-auth-{self.forward_auth.get_remote_app_name()}"
-        )
-
-        if data.get("name") == self.forward_auth.get_remote_app_name():
-            # Remove the middleware key from oathkeeper; keep only its definition
-            router_cfg[traefik_router_name]["middlewares"].remove(forward_auth_middleware)
-            if f"{traefik_router_name}-tls" in router_cfg:
-                router_cfg[f"{traefik_router_name}-tls"]["middlewares"].remove(
-                    forward_auth_middleware
-                )
-
-        # Append the middleware if the app name was provided by forward-auth
-        forward_auth_config = self.forward_auth.get_provider_info()
-        if data.get("name") in forward_auth_config.app_names:  # type: ignore
-            # ForwardAuth must come before other middlewares
-            router_cfg[traefik_router_name]["middlewares"].insert(0, forward_auth_middleware)
-            if f"{traefik_router_name}-tls" in router_cfg:
-                router_cfg[f"{traefik_router_name}-tls"]["middlewares"].insert(
-                    0, forward_auth_middleware
-                )
-
-        return (
-            router_cfg[traefik_router_name]["middlewares"],
-            router_cfg[f"{traefik_router_name}-tls"]["middlewares"],
-        )
 
     def _generate_tls_block(
         self,
