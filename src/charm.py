@@ -6,6 +6,11 @@
 import contextlib
 import enum
 import functools
+<<<<<<< HEAD
+=======
+import ipaddress
+import itertools
+>>>>>>> e1462d6 (refactor: address review comments)
 import json
 import logging
 import socket
@@ -26,8 +31,8 @@ from charms.certificate_transfer_interface.v0.certificate_transfer import (
 from charms.grafana_k8s.v0.grafana_dashboard import GrafanaDashboardProvider
 from charms.loki_k8s.v0.loki_push_api import LogProxyConsumer
 from charms.oathkeeper.v0.forward_auth import (
-    ForwardAuthConfigChangedEvent,
-    ForwardAuthConfigRemovedEvent,
+    AuthConfigChangedEvent,
+    AuthConfigRemovedEvent,
     ForwardAuthRequirer,
     RequirerConfig,
 )
@@ -199,7 +204,7 @@ class TraefikIngressCharm(CharmBase):
         )
 
         self.forward_auth = ForwardAuthRequirer(
-            self, forward_auth_requirer_config=self._forward_auth_requirer_config
+            self, forward_auth_requirer_config=self._forward_auth_config
         )
 
         observe = self.framework.observe
@@ -235,12 +240,8 @@ class TraefikIngressCharm(CharmBase):
             self._on_recv_ca_cert_removed,
         )
 
-        observe(
-            self.forward_auth.on.forward_auth_config_changed, self._on_forward_auth_config_changed
-        )
-        observe(
-            self.forward_auth.on.forward_auth_config_removed, self._on_forward_auth_config_removed
-        )
+        observe(self.forward_auth.on.auth_config_changed, self._on_forward_auth_config_changed)
+        observe(self.forward_auth.on.auth_config_removed, self._on_forward_auth_config_removed)
 
         # observe data_provided and data_removed events for all types of ingress we offer:
         for ingress in (self.ingress_per_unit, self.ingress_per_appv1, self.ingress_per_appv2):
@@ -269,23 +270,24 @@ class TraefikIngressCharm(CharmBase):
             ServicePort(int(port), name=name) for name, port in self._tcp_entrypoints().items()
         ]
     
-    def _forward_auth_requirer_config(self) -> RequirerConfig:
-        ingress_app_names = []
-        for ingress_relation in (
-            self.ingress_per_appv1.relations
-            + self.ingress_per_appv2.relations
-            + self.ingress_per_unit.relations
-            + self.traefik_route.relations
-        ):
-            ingress_app_names.append(ingress_relation.app.name)  # type: ignore
+    def _forward_auth_config(self) -> RequirerConfig:
+        ingress_app_names = [
+            rel.app.name  # type: ignore
+            for rel in itertools.chain(
+                self.ingress_per_appv1.relations,
+                self.ingress_per_appv2.relations,
+                self.ingress_per_unit.relations,
+                self.traefik_route.relations,
+            )
+        ]
         return RequirerConfig(ingress_app_names)
 
-    def _on_forward_auth_config_changed(self, event: ForwardAuthConfigChangedEvent):
-        self.forward_auth.update_requirer_relation_data(self._forward_auth_requirer_config)
+    def _on_forward_auth_config_changed(self, event: AuthConfigChangedEvent):
+        self.forward_auth.update_requirer_relation_data(self._forward_auth_config)
         if self.forward_auth.is_ready():
             self._process_status_and_configurations()
 
-    def _on_forward_auth_config_removed(self, event: ForwardAuthConfigRemovedEvent):
+    def _on_forward_auth_config_removed(self, event: AuthConfigRemovedEvent):
         self._process_status_and_configurations()
 
     def _on_recv_ca_cert_available(self, event: CertificateTransferAvailableEvent):
@@ -590,7 +592,7 @@ class TraefikIngressCharm(CharmBase):
         self._process_status_and_configurations()
 
         if self.forward_auth.is_ready():
-            self.forward_auth.update_requirer_relation_data(self._forward_auth_requirer_config)
+            self.forward_auth.update_requirer_relation_data(self._forward_auth_config)
 
         if isinstance(self.unit.status, MaintenanceStatus):
             self.unit.status = ActiveStatus()
@@ -602,7 +604,7 @@ class TraefikIngressCharm(CharmBase):
         )
 
         if self.forward_auth.is_ready():
-            self.forward_auth.update_requirer_relation_data(self._forward_auth_requirer_config)
+            self.forward_auth.update_requirer_relation_data(self._forward_auth_config)
 
         # FIXME? on relation broken, data is still there so cannot simply call
         #  self._process_status_and_configurations(). For this reason, the static config in
