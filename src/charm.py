@@ -228,9 +228,7 @@ class TraefikIngressCharm(CharmBase):
             ],
         )
 
-        self.forward_auth = ForwardAuthRequirer(
-            self, forward_auth_requirer_config=self._forward_auth_config
-        )
+        self.forward_auth = ForwardAuthRequirer(self, relation_name="experimental-forward-auth")
 
         observe = self.framework.observe
 
@@ -308,9 +306,14 @@ class TraefikIngressCharm(CharmBase):
         return RequirerConfig(ingress_app_names)
 
     def _on_forward_auth_config_changed(self, event: AuthConfigChangedEvent):
-        self.forward_auth.update_requirer_relation_data(self._forward_auth_config)
-        if self.forward_auth.is_ready():
-            self._process_status_and_configurations()
+        if self.config["enable_experimental_forward_auth"]:
+            self.forward_auth.update_requirer_relation_data(self._forward_auth_config)
+            if self.forward_auth.is_ready():
+                self._process_status_and_configurations()
+        else:
+            logger.info(
+                "The `enable_experimental_forward_auth` config option is not enabled. Forward-auth relation will not be processed"
+            )
 
     def _on_forward_auth_config_removed(self, event: AuthConfigRemovedEvent):
         self._process_status_and_configurations()
@@ -651,6 +654,10 @@ class TraefikIngressCharm(CharmBase):
         # reconsider all data sent over the relations and all configs
         new_external_host = self.external_host
         new_routing_mode = self.config["routing_mode"]
+
+        if self.config["enable_experimental_forward_auth"]:
+            self.forward_auth.update_requirer_relation_data(self._forward_auth_config)
+
         # TODO set BlockedStatus here when compound_status is introduced
         #  https://github.com/canonical/operator/issues/665
 
@@ -986,18 +993,19 @@ class TraefikIngressCharm(CharmBase):
           different pieces of middleware instead"
         """
         forwardauth_middleware = {}
-        if self.forward_auth.is_ready():
-            forward_auth_config = self.forward_auth.get_provider_info()
-            if data.get("name") in forward_auth_config.app_names:  # type: ignore
-                policy_decision_point_app = self.forward_auth.get_remote_app_name()
-                forwardauth_middleware[
-                    f"juju-sidecar-forward-auth-{policy_decision_point_app}"
-                ] = {
-                    "forwardAuth": {
-                        "address": forward_auth_config.decisions_address,  # type: ignore
-                        "authResponseHeaders": forward_auth_config.headers,  # type: ignore
+        if self.config["enable_experimental_forward_auth"]:
+            if self.forward_auth.is_ready():
+                forward_auth_config = self.forward_auth.get_provider_info()
+                if data.get("name") in forward_auth_config.app_names:  # type: ignore
+                    policy_decision_point_app = self.forward_auth.get_remote_app_name()
+                    forwardauth_middleware[
+                        f"juju-sidecar-forward-auth-{policy_decision_point_app}"
+                    ] = {
+                        "forwardAuth": {
+                            "address": forward_auth_config.decisions_address,  # type: ignore
+                            "authResponseHeaders": forward_auth_config.headers,  # type: ignore
+                        }
                     }
-                }
 
         no_prefix_middleware = {}  # type: Dict[str, Dict[str, Any]]
         if self._routing_mode is _RoutingMode.path:
