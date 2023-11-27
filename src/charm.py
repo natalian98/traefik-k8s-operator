@@ -308,7 +308,6 @@ class TraefikIngressCharm(CharmBase):
 
     def _on_forward_auth_config_changed(self, event: AuthConfigChangedEvent):
         if self.config["enable_experimental_forward_auth"]:
-            self.forward_auth.update_requirer_relation_data(self._forward_auth_config)
             if self.forward_auth.is_ready():
                 self._process_status_and_configurations()
         else:
@@ -722,6 +721,11 @@ class TraefikIngressCharm(CharmBase):
             self._clear_all_configs_and_restart_traefik()
             # we do this BEFORE processing the relations.
 
+        errors = False
+        
+        if self.config["enable_experimental_forward_auth"]:
+            self.forward_auth.update_requirer_relation_data(self._forward_auth_config)
+
         for ingress_relation in (
             self.ingress_per_appv1.relations
             + self.ingress_per_appv2.relations
@@ -778,9 +782,6 @@ class TraefikIngressCharm(CharmBase):
         # update-status.
         self._process_status_and_configurations()
 
-        if self.forward_auth.is_ready():
-            self.forward_auth.update_requirer_relation_data(self._forward_auth_config)
-
         if isinstance(self.unit.status, MaintenanceStatus):
             self.unit.status = ActiveStatus()
 
@@ -789,9 +790,6 @@ class TraefikIngressCharm(CharmBase):
         self._wipe_ingress_for_relation(
             event.relation, wipe_rel_data=not isinstance(event, RelationBrokenEvent)
         )
-
-        if self.forward_auth.is_ready():
-            self.forward_auth.update_requirer_relation_data(self._forward_auth_config)
 
         # FIXME? on relation broken, data is still there so cannot simply call
         #  self._process_status_and_configurations(). For this reason, the static config in
@@ -995,18 +993,14 @@ class TraefikIngressCharm(CharmBase):
         """
         forwardauth_middleware = {}
         if self.config["enable_experimental_forward_auth"]:
-            if self.forward_auth.is_ready():
+            if self.forward_auth.is_protected_app(app=data.get("name")):  # type: ignore
                 forward_auth_config = self.forward_auth.get_provider_info()
-                if data.get("name") in forward_auth_config.app_names:  # type: ignore
-                    policy_decision_point_app = self.forward_auth.get_remote_app_name()
-                    forwardauth_middleware[
-                        f"juju-sidecar-forward-auth-{policy_decision_point_app}"
-                    ] = {
-                        "forwardAuth": {
-                            "address": forward_auth_config.decisions_address,  # type: ignore
-                            "authResponseHeaders": forward_auth_config.headers,  # type: ignore
-                        }
+                forwardauth_middleware[f"juju-sidecar-forward-auth-{prefix}"] = {
+                    "forwardAuth": {
+                        "address": forward_auth_config.decisions_address,  # type: ignore
+                        "authResponseHeaders": forward_auth_config.headers,  # type: ignore
                     }
+                }
 
         no_prefix_middleware = {}  # type: Dict[str, Dict[str, Any]]
         if self._routing_mode is _RoutingMode.path:
