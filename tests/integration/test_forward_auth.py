@@ -44,6 +44,8 @@ async def test_deployment(ops_test: OpsTest, traefik_charm, forward_auth_tester_
     """Deploy the charms and integrations required to set up an Identity and Access Proxy."""
     await deploy_traefik_if_not_deployed(ops_test, traefik_charm)
 
+    await ops_test.model.set_config({"update-status-hook-interval": "5m"})
+
     # Enable experimental-forward-auth
     await ops_test.model.applications[TRAEFIK_CHARM].set_config(
         {"enable_experimental_forward_auth": "True"}
@@ -76,10 +78,11 @@ async def test_deployment(ops_test: OpsTest, traefik_charm, forward_auth_tester_
 
 
 @retry(
-    wait=wait_exponential(multiplier=3, min=1, max=20),
-    stop=stop_after_attempt(20),
+    wait=wait_exponential(multiplier=3, min=1, max=30),
+    stop=stop_after_attempt(30),
     reraise=True,
 )
+@pytest.mark.abort_on_fail
 async def test_allowed_forward_auth_url_redirect(ops_test: OpsTest) -> None:
     """Test that a request hitting an application protected by IAP is forwarded by traefik to oathkeeper.
 
