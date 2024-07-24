@@ -101,5 +101,4 @@ jobs:
         if: failure()
 
       - name: Dump logs
-        if: failure()
         uses: canonical/charming-actions/dump-logs@main
